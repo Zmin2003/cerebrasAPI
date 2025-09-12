@@ -1,1 +1,2 @@
-# qwen3
+# cerebras中转
+环境密钥CEREBRAS_API_KEY为官key
