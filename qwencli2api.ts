@@ -1,80 +1,118 @@
-// 导入 Deno 标准库中的 serve 函数，用于快速创建一个 HTTP 服务器
 import { serve } from "https://deno.land/std@0.192.0/http/server.ts";
 
-// 定义目标 API 地址
+// --- 配置项 ---
 const CEREBRAS_API_URL = 'https://api.cerebras.ai/v1/chat/completions';
+// 设置处理请求的间隔时间（毫秒）。例如 200ms 表示每秒最多处理 5 个请求。
+// 1000ms / RATE_LIMIT_MS = 每秒最大请求数
+const RATE_LIMIT_MS = 200; 
 
-// 定义 CORS 响应头，允许任何来源的跨域请求
-// 这对于在前端网页中调用此代理至关重要
+// --- CORS 头 ---
 const CORS_HEADERS = {
-  'Access-Control-Allow-Origin': '*', // 允许任何来源
-  'Access-Control-Allow-Methods': 'POST, OPTIONS', // 允许的方法
-  'Access-Control-Allow-Headers': 'Content-Type', // 允许的请求头
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type',
 };
 
-// 主处理函数，每个请求都会进入这里
-async function handler(req: Request): Promise<Response> {
-  // 浏览器在发送跨域的 POST 请求前，会先发送一个 OPTIONS "预检"请求
-  // 我们需要正确响应这个预检请求，否则浏览器会阻止后续的 POST 请求
-  if (req.method === 'OPTIONS') {
-    return new Response(null, { status: 204, headers: CORS_HEADERS });
+// --- 核心状态管理 ---
+
+// 请求队列，用于存储待处理的请求
+// 每个元素包含请求体和用于响应客户端的 resolve 函数
+const requestQueue: { body: any; resolve: (response: Response) => void }[] = [];
+
+// API Key 池
+let apiKeys: string[] = [];
+let currentKeyIndex = 0;
+
+// --- 初始化 API Keys ---
+function initializeKeys() {
+  const keysString = Deno.env.get("CEREBRAS_API_KEYS");
+  if (keysString) {
+    apiKeys = keysString.split(',').map(key => key.trim()).filter(key => key);
+    console.log(`Initialized with ${apiKeys.length} API keys.`);
+  } else {
+    console.error("CEREBRAS_API_KEYS environment variable not set!");
+  }
+}
+
+// --- 请求处理器（工人） ---
+async function processQueue() {
+  // 如果队列为空或没有可用的 Key，则不处理
+  if (requestQueue.length === 0 || apiKeys.length === 0) {
+    return;
   }
 
-  // 只处理 POST 请求，其他方法返回错误
-  if (req.method !== 'POST') {
-    return new Response("Method Not Allowed", { status: 405, headers: CORS_HEADERS });
-  }
+  // 从队列头部取出一个请求
+  const { body, resolve } = requestQueue.shift()!;
 
-  // 从环境变量中安全地获取 API 密钥
-  // 这是在 Deno Deploy 网站上设置的，不会暴露在代码里
-  const apiKey = Deno.env.get("CEREBRAS_API_KEY");
-  if (!apiKey) {
-    console.error("CEREBRAS_API_KEY is not set in environment variables.");
-    return new Response("Server configuration error: API key not found.", { status: 500, headers: CORS_HEADERS });
-  }
+  // 轮询选择一个 Key
+  const apiKey = apiKeys[currentKeyIndex];
+  currentKeyIndex = (currentKeyIndex + 1) % apiKeys.length;
+  
+  console.log(`Processing request with key index: ${currentKeyIndex}`);
 
   try {
-    // 解析客户端发来的 JSON 请求体
-    const requestBody = await req.json();
-
-    // 使用 fetch API 向真正的 Cerebras API 发起请求
-    // 1. 使用目标 URL
-    // 2. 方法是 POST
-    // 3. 设置必要的请求头，特别是 Content-Type 和 Authorization
-    // 4. 将客户端的请求体转换成字符串后作为我们的请求体
     const apiResponse = await fetch(CEREBRAS_API_URL, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${apiKey}`,
       },
-      body: JSON.stringify(requestBody),
+      body: JSON.stringify(body),
     });
 
-    // 创建一个新的 Headers 对象，复制来自 Cerebras API 的响应头
+    // 复制响应头并添加 CORS
     const responseHeaders = new Headers(apiResponse.headers);
-    
-    // 在响应头上添加我们自己的 CORS 设置
     Object.entries(CORS_HEADERS).forEach(([key, value]) => {
       responseHeaders.set(key, value);
     });
 
-    // 将 Cerebras API 的响应（包括状态码、响应头和响应体）直接返回给客户端
-    // apiResponse.body 是一个 ReadableStream，Deno 会自动处理流式传输
-    // 这意味着如果 Cerebras API 是流式输出（"stream": true），我们的代理也能完美支持
-    return new Response(apiResponse.body, {
+    // 将最终响应返回给等待的客户端
+    resolve(new Response(apiResponse.body, {
       status: apiResponse.status,
       statusText: apiResponse.statusText,
       headers: responseHeaders,
-    });
+    }));
 
   } catch (error) {
-    // 如果请求体不是有效的 JSON，或者发生其他网络错误，捕获并返回错误信息
-    console.error("Error processing request:", error);
-    return new Response(`Error: ${error.message}`, { status: 400, headers: CORS_HEADERS });
+    console.error("Error forwarding request to Cerebras:", error);
+    resolve(new Response(`Proxy error: ${error.message}`, { status: 502, headers: CORS_HEADERS }));
   }
 }
 
-// 启动服务器
-console.log("Cerebras proxy server starting on port 8000...");
+// --- HTTP 服务器主处理函数 ---
+async function handler(req: Request): Promise<Response> {
+  if (req.method === 'OPTIONS') {
+    return new Response(null, { status: 204, headers: CORS_HEADERS });
+  }
+
+  if (req.method !== 'POST') {
+    return new Response("Method Not Allowed", { status: 405, headers: CORS_HEADERS });
+  }
+
+  if (apiKeys.length === 0) {
+     return new Response("Server configuration error: No API keys configured.", { status: 500, headers: CORS_HEADERS });
+  }
+
+  try {
+    const requestBody = await req.json();
+
+    // 创建一个 Promise，将 resolve 函数存入队列
+    // 这个 Promise 会一直等待，直到队列处理器调用 resolve
+    return new Promise((resolve) => {
+      requestQueue.push({ body: requestBody, resolve });
+    });
+
+  } catch (error) {
+    return new Response(`Invalid JSON body: ${error.message}`, { status: 400, headers: CORS_HEADERS });
+  }
+}
+
+// --- 启动服务和处理器 ---
+initializeKeys(); // 启动时立即加载 Keys
 serve(handler);
+// 每隔 RATE_LIMIT_MS 毫秒，就尝试处理一次队列中的请求
+setInterval(processQueue, RATE_LIMIT_MS);
+
+console.log(`Cerebras smart proxy started.`);
+console.log(`- Request processing interval: ${RATE_LIMIT_MS}ms`);
+console.log(`- Max requests per second (approx): ${1000 / RATE_LIMIT_MS}`);
